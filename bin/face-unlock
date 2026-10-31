@@ -382,7 +382,7 @@ enable_plugin() {
 # ---------------------------------------------------------------- wizard ----
 
 wizard() {
-  interactive || die "The setup wizard needs a terminal (try: omarchy-launch-floating-terminal-with-presentation face-unlock setup)."
+  interactive || die "The setup wizard needs an interactive terminal. Run: omarchy-launch-floating-terminal-with-presentation \"$SELF setup\""
   clear
   banner
   say "" "This wizard will:" \
