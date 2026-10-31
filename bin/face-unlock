@@ -3,7 +3,8 @@
 # phi0x.face-unlock Omarchy plugin.
 #
 #   face-unlock                  interactive home screen
-#   face-unlock setup            first-time setup wizard (safe to re-run)
+#   face-unlock setup [--review] first-time setup wizard (safe to re-run;
+#                                --review steps through yay's prompts)
 #   face-unlock faces            interactive face manager
 #   face-unlock faces list|add [LABEL]|remove ID...|clear
 #   face-unlock camera [list|set PATH]
@@ -185,7 +186,8 @@ choose_camera() {
     return 1
   fi
   current=$(current_camera)
-  if ! interactive; then
+  if ! interactive || [[ $(wc -l <<<"$cams") -eq 1 ]]; then
+    # Nothing to choose between: use the only (or first) camera.
     cam=$(cut -f1 <<<"$cams" | head -n1)
   else
     local selected=()
@@ -381,12 +383,34 @@ enable_plugin() {
 
 # ---------------------------------------------------------------- wizard ----
 
+REVIEW=0
+
+install_howdy_unattended() {
+  # Builds from the AUR without prompts. --sudoloop keeps the sudo timestamp
+  # fresh through the multi-minute build so no password prompt can hide
+  # behind the spinner. `face-unlock setup --review` restores yay's prompts.
+  local log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-face-unlock"
+  local log="$log_dir/install.log"
+  mkdir -p "$log_dir"
+  say "Building Howdy Next from the AUR ($HOWDY_PKG) — this takes a few minutes." \
+    "$(gum style --faint "Full log: $log")"
+  if gum spin --title "Installing Howdy Next… (a few minutes)" -- bash -c \
+    'yay -S --needed --noconfirm --answerdiff None --answerclean None --answeredit None --removemake --sudoloop "$1" >"$2" 2>&1' \
+    _ "$HOWDY_PKG" "$log"; then
+    return 0
+  fi
+  warn "Installation failed. Last lines of the log:"
+  tail -n 25 "$log" | sed 's/^/    /'
+  say "" "Re-run with 'face-unlock setup --review' to step through yay's prompts."
+  return 1
+}
+
 wizard() {
   interactive || die "The setup wizard needs an interactive terminal. Run: omarchy-launch-floating-terminal-with-presentation \"$SELF setup\""
   clear
   banner
   say "" "This wizard will:" \
-    "  1. install Howdy Next, the face recognition engine" \
+    "  1. install Howdy Next, the face recognition engine (automatic)" \
     "  2. pick your camera and teach it your face" \
     "  3. add Face Unlock to the Omarchy lock screen" ""
   gum style --border rounded --padding "0 2" --margin "0 1" \
@@ -406,13 +430,12 @@ wizard() {
   if howdy_installed; then
     ok "Howdy Next is installed ($(howdy version 2>/dev/null | head -n1))."
   else
-    say "Howdy Next is built from the AUR ($HOWDY_PKG). yay will show you the" \
-      "build files and ask before installing; this can take a few minutes."
-    confirm "Install $HOWDY_PKG now?" || { warn "Setup needs Howdy Next. Run 'face-unlock setup' again any time."; return 1; }
-    if have yay; then
+    have yay || die "yay is not available; install $HOWDY_PKG from the AUR manually and re-run setup."
+    if ((REVIEW)); then
+      say "Review mode: yay will show the build files and ask before installing."
       yay -S --needed "$HOWDY_PKG" || die "Installation failed."
     else
-      die "yay is not available; install $HOWDY_PKG from the AUR manually and re-run setup."
+      install_howdy_unattended || return 1
     fi
     howdy_installed || die "Howdy Next did not install correctly."
     ok "Installed Howdy Next."
@@ -457,8 +480,10 @@ wizard() {
   fi
 
   # 5. Look and feel ------------------------------------------------------------
-  title "5 · Bar icon & launcher"
-  if confirm "Show a Face Unlock icon in the top bar?"; then set_setting showBarIcon true; else set_setting showBarIcon false; fi
+  title "5 · Finishing up"
+  # Default on without asking: the icon itself has "Hide this bar icon".
+  [[ $(jq -r 'has("showBarIcon")' "$SETTINGS") == true ]] || set_setting showBarIcon true
+  ok "Bar icon $([[ $(setting showBarIcon true) == true ]] && echo 'shown (hide it from its menu)' || echo 'hidden (face-unlock bar show)')."
   install_launcher && ok "Added “Face Unlock” to the app launcher."
 
   if enable_plugin; then
@@ -575,7 +600,10 @@ main() {
   shift || true
   case $cmd in
     "") home ;;
-    setup) wizard ;;
+    setup)
+      [[ ${1:-} == --review ]] && REVIEW=1
+      wizard
+      ;;
     faces)
       local sub="${1:-}"
       shift || true

@@ -65,8 +65,9 @@ omarchy plugin add https://github.com/phi0x/omarchy-face-unlock.git
 
 The wizard:
 
-1. installs `howdy-next-git` from the AUR (yay shows the build files and asks
-   first) and downloads its recognition models
+1. installs `howdy-next-git` from the AUR unattended (no yay prompts; use
+   `face-unlock setup --review` to inspect the build files first) and
+   downloads its recognition models
 2. lets you choose a camera
 3. enrolls your face, plus any extra looks you want
 4. writes `/etc/pam.d/omarchy-lock-face` and, if you choose, adds face to sudo
@@ -79,7 +80,7 @@ and press any key.
 
 ```text
 face-unlock                  home screen (also in the app launcher)
-face-unlock setup            setup wizard (safe to re-run)
+face-unlock setup [--review] setup wizard (safe to re-run)
 face-unlock faces            manage faces: add, remove, remove all, test
 face-unlock faces list|add [LABEL]|remove ID...|clear
 face-unlock camera [list|set PATH]
