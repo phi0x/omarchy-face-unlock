@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+# face-unlock — setup wizard, face manager and settings for the
+# phi0x.face-unlock Omarchy plugin.
+#
+#   face-unlock                  interactive home screen
+#   face-unlock setup            first-time setup wizard (safe to re-run)
+#   face-unlock faces            interactive face manager
+#   face-unlock faces list|add [LABEL]|remove ID...|clear
+#   face-unlock camera [list|set PATH]
+#   face-unlock enable|disable|toggle
+#   face-unlock bar show|hide
+#   face-unlock status [--json]
+#   face-unlock demo [idle|scanning|success|failure|resting|off]
+#   face-unlock install-launcher | uninstall
+#
+# Privileged steps use sudo in the terminal. Nothing here stores or prints
+# face data; models stay in Howdy's root-owned directory.
+
+set -uo pipefail
+
+PLUGIN_ID="phi0x.face-unlock"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+PLUGIN_DIR="$(dirname "$(dirname "$SELF")")"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-face-unlock"
+SETTINGS="$CONF_DIR/settings.json"
+PAM_FACE="/etc/pam.d/omarchy-lock-face"
+PAM_SUDO="/etc/pam.d/sudo"
+SUDO_LINE="auth       sufficient   pam_howdy.so"
+HOWDY_PKG="howdy-next-git"
+DESKTOP_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/applications/face-unlock.desktop"
+BIN_LINK="$HOME/.local/bin/face-unlock"
+TARGET_USER="${USER:-$(id -un)}"
+
+DEFAULT_SETTINGS='{
+  "enabled": true,
+  "showBarIcon": true,
+  "graceSeconds": 2.5,
+  "backoffSeconds": [2, 5, 15, 30],
+  "maxAttempts": 5,
+  "pauseMinutes": 10
+}'
+
+# ---------------------------------------------------------------- helpers ---
+
+have() { command -v "$1" >/dev/null 2>&1; }
+interactive() { [[ -t 0 && -t 1 ]] && have gum; }
+
+die() { printf '\e[31m%s\e[0m\n' "$*" >&2; exit 1; }
+info() { printf '\e[2m%s\e[0m\n' "$*"; }
+ok() { printf '\e[32m✓\e[0m %s\n' "$*"; }
+warn() { printf '\e[33m!\e[0m %s\n' "$*"; }
+
+title() {
+  if interactive; then
+    gum style --bold --padding "0 1" --margin "1 0 0 0" "$1"
+  else
+    printf '\n== %s ==\n' "$1"
+  fi
+}
+
+say() {
+  if interactive; then gum style --padding "0 1" "$@"; else printf '%s\n' "$@"; fi
+}
+
+confirm() {
+  # confirm "question" [default-yes|default-no]
+  if ! interactive; then return 1; fi
+  if [[ ${2:-default-yes} == default-no ]]; then
+    gum confirm --default=false "$1"
+  else
+    gum confirm "$1"
+  fi
+}
+
+pause() { interactive && gum input --placeholder "Press Enter to continue" >/dev/null || true; }
+
+banner() {
+  local face
+  face=$(cat <<'EOF'
+ ╭─╮     ╭─╮
+ │  ╹   ╹  │
+ │    ┃    │
+ │    ┛    │
+ │  ╰───╯  │
+ ╰─╯     ╰─╯
+EOF
+)
+  if interactive; then
+    gum join --horizontal --align center \
+      "$(gum style --padding "1 2" "$face")" \
+      "$(gum style --padding "1 2" "$(gum style --bold 'Face Unlock')" "Unlock Omarchy by looking at it" "$(gum style --faint "$(status_line)")")"
+  else
+    printf 'Face Unlock — %s\n' "$(status_line)"
+  fi
+}
+
+ensure_settings() {
+  mkdir -p "$CONF_DIR"
+  if [[ ! -s $SETTINGS ]] || ! jq -e 'type == "object"' "$SETTINGS" >/dev/null 2>&1; then
+    printf '%s\n' "$DEFAULT_SETTINGS" >"$SETTINGS"
+  fi
+}
+
+setting() { # setting KEY DEFAULT
+  ensure_settings
+  local v
+  v=$(jq -r --arg k "$1" 'if has($k) then .[$k] | tostring else empty end' "$SETTINGS" 2>/dev/null)
+  printf '%s' "${v:-$2}"
+}
+
+set_setting() { # set_setting KEY JSON_VALUE
+  ensure_settings
+  local tmp
+  tmp=$(mktemp "$CONF_DIR/.settings.XXXXXX") || die "Could not write settings"
+  if jq --arg k "$1" --argjson v "$2" '.[$k] = $v' "$SETTINGS" >"$tmp"; then
+    mv -f "$tmp" "$SETTINGS"
+  else
+    rm -f "$tmp"
+    die "Could not update $1"
+  fi
+}
+
+howdy_installed() { have howdy && [[ -e /usr/lib/security/pam_howdy.so ]]; }
+pam_configured() { [[ -f $PAM_FACE ]]; }
+sudo_configured() { grep -qE '^\s*auth\s+sufficient\s+pam_howdy\.so\s*$' "$PAM_SUDO" 2>/dev/null; }
+
+plugin_state() {
+  omarchy plugin list --json 2>/dev/null |
+    jq -r --arg id "$PLUGIN_ID" '(.plugins? // .)[]? | select(.id == $id) | (.state // (if .enabled then "enabled" else "disabled" end))' 2>/dev/null | head -n1
+}
+
+status_line() {
+  if ! howdy_installed; then echo "Not set up yet"; return; fi
+  if ! pam_configured; then echo "Howdy installed · lock screen not configured"; return; fi
+  if [[ $(setting enabled true) == true ]]; then echo "On · lock screen ready"; else echo "Off · password only"; fi
+}
+
+need_sudo() {
+  say "$(gum style --faint 'Some steps need administrator rights.' 2>/dev/null || echo 'Some steps need administrator rights.')"
+  sudo -v || die "sudo is required for this step."
+}
+
+camera_list() {
+  # Prints "path<TAB>friendly name" for capture nodes, preferring stable ids.
+  local dev name seen=()
+  shopt -s nullglob
+  for dev in /dev/v4l/by-id/*-video-index0 /dev/v4l/by-path/*-video-index0; do
+    # by-path is only a fallback for cameras without a usable id.
+    if [[ $dev == /dev/v4l/by-path/* ]] && printf '%s\n' "${seen[@]:-}" | grep -qx "$(readlink -f "$dev")"; then continue; fi
+    seen+=("$(readlink -f "$dev")")
+    name=$(basename "$dev")
+    name=${name#usb-}
+    name=${name%-video-index0}
+    name=${name//_/ }
+    printf '%s\t%s\n' "$dev" "$name"
+  done
+  shopt -u nullglob
+}
+
+valid_label() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9\ _.-]{0,31}$ ]]; }
+
+camera_name() { # camera_name PATH -> friendly name (or the path)
+  local n
+  n=$(camera_list | awk -F'\t' -v p="$1" '$1 == p { print $2; exit }')
+  printf '%s' "${n:-$1}"
+}
+
+current_camera() { setting camera ""; }
+
+set_camera() { # set_camera PATH
+  local cam="$1"
+  [[ -e $cam ]] || die "No camera at $cam"
+  [[ $(readlink -f "$cam") == /dev/video* ]] || die "$cam is not a video device"
+  sudo howdy set device_path "$cam" >/dev/null || die "Howdy could not use $cam"
+  set_setting camera "$(jq -Rn --arg v "$cam" '$v')"
+  ok "Camera set to $(camera_name "$cam")."
+}
+
+choose_camera() {
+  # Lists every connected capture device; the current one is pre-selected.
+  local cams current pick cam
+  cams=$(camera_list)
+  if [[ -z $cams ]]; then
+    warn "No camera found. Plug in a webcam and try again."
+    return 1
+  fi
+  current=$(current_camera)
+  if ! interactive; then
+    cam=$(cut -f1 <<<"$cams" | head -n1)
+  else
+    local selected=()
+    [[ -n $current ]] && selected=(--selected "$(camera_name "$current")")
+    pick=$(cut -f2 <<<"$cams" | gum choose --header "Which camera should look for you?" "${selected[@]}") || return 1
+    cam=$(awk -F'\t' -v n="$pick" '$2 == n { print $1; exit }' <<<"$cams")
+  fi
+  set_camera "$cam"
+  say "Tip: an IR camera (Windows Hello style) is much harder to fool than a regular webcam."
+}
+
+camera_menu() {
+  howdy_installed || { warn "Howdy isn't installed yet — run the setup first."; return 1; }
+  need_sudo
+  clear
+  title "Camera"
+  local cur; cur=$(current_camera)
+  say "Current: $([[ -n $cur ]] && camera_name "$cur" || echo 'not set')" ""
+  choose_camera
+  if [[ -n $(faces_list_raw) ]] && interactive; then
+    say "" "Faces enrolled on a different camera may match less reliably."
+    confirm "Add a look with this camera now?" default-no && face_add
+  fi
+  pause
+}
+
+# ---------------------------------------------------------------- faces -----
+
+faces_list_raw() { sudo howdy -U "$TARGET_USER" list --plain 2>/dev/null | sed '/^\s*$/d'; }
+
+faces_print() {
+  local rows
+  rows=$(faces_list_raw) || true
+  if [[ -z $rows ]]; then
+    say "No faces enrolled yet."
+    return 1
+  fi
+  if interactive; then
+    { echo "ID,Added,Look"; printf '%s\n' "$rows"; } | gum table --print --separator "," --border rounded
+  else
+    printf '%s\n' "$rows"
+  fi
+}
+
+face_add() {
+  local label="${1:-}"
+  if [[ -z $label ]] && interactive; then
+    label=$(gum choose --header "What does this look like?" \
+      "Default" "Glasses" "No glasses" "Low light" "Headphones" "Something else…") || return 1
+    if [[ $label == "Something else…" ]]; then
+      label=$(gum input --placeholder "e.g. Beard, Contacts, Office" --char-limit 32) || return 1
+    fi
+  fi
+  label=${label:-Default}
+  valid_label "$label" || die "Labels may use letters, numbers, spaces, . _ - (max 32)."
+
+  say "" "Sit as you normally would, look straight at the camera and keep still." \
+    "The camera light will turn on for a few seconds."
+  if interactive; then gum spin --title "Get ready…" -- sleep 2; fi
+  if sudo howdy -U "$TARGET_USER" -y add "$label"; then
+    ok "Added “$label”."
+  else
+    warn "Howdy could not add that face. Try more even lighting and keep your whole face in view."
+    return 1
+  fi
+}
+
+face_remove() {
+  local ids=("$@")
+  if ((${#ids[@]} == 0)) && interactive; then
+    local rows choice
+    rows=$(faces_list_raw)
+    [[ -n $rows ]] || { say "No faces enrolled."; return 0; }
+    choice=$(printf '%s\n' "$rows" | awk -F, '{ l=$0; sub(/^[^,]*,[^,]*,/, "", l); gsub(/^"|"$/, "", l); printf "%s · %s · added %s\n", $1, l, $2 }' |
+      gum choose --no-limit --header "Remove which faces? (space to select, enter to confirm)") || return 0
+    [[ -n $choice ]] || return 0
+    mapfile -t ids < <(printf '%s\n' "$choice" | awk -F' · ' '{print $1}')
+    confirm "Remove ${#ids[@]} face(s)?" default-no || return 0
+  fi
+  ((${#ids[@]})) || die "Usage: face-unlock faces remove ID..."
+  local id
+  # Highest id first, in case ids are renumbered after a removal.
+  for id in $(printf '%s\n' "${ids[@]}" | sort -rn); do
+    [[ $id =~ ^[0-9]+$ ]] || die "Not a face id: $id"
+    if sudo howdy -U "$TARGET_USER" -y remove "$id" >/dev/null; then ok "Removed face $id."; else warn "Could not remove face $id."; fi
+  done
+}
+
+face_clear() {
+  if interactive; then confirm "Remove every enrolled face for $TARGET_USER?" default-no || return 0; fi
+  sudo howdy -U "$TARGET_USER" -y clear && ok "All faces removed."
+}
+
+face_test() {
+  say "Howdy will open the camera and show what it sees." "Close the preview window (or press Esc) when you are done."
+  sudo howdy -U "$TARGET_USER" test || warn "The camera test ended with an error."
+}
+
+faces_menu() {
+  howdy_installed || { warn "Howdy isn't installed yet — run the setup first."; return 1; }
+  need_sudo
+  while true; do
+    clear
+    title "Your faces"
+    faces_print || true
+    say "" "Tip: add a few looks (glasses, low light) for faster, more reliable matches."
+    local action
+    action=$(gum choose --header "" "Add a look" "Remove faces" "Test the camera" "Remove all faces" "Back") || return 0
+    case $action in
+      "Add a look") face_add || pause ;;
+      "Remove faces") face_remove ;;
+      "Test the camera") face_test; pause ;;
+      "Remove all faces") face_clear ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- system ----
+
+write_face_pam() {
+  # pam_faillock preauth keeps face from bypassing a password lockout without
+  # counting face misses against it. The password stack is never modified.
+  sudo tee "$PAM_FACE" >/dev/null <<'EOF'
+#%PAM-1.0
+# Managed by phi0x.face-unlock (`face-unlock setup`). Remove with `face-unlock uninstall`.
+# Used only by the Omarchy lock screen's Face Unlock flow; the password flow
+# (omarchy-lock-password) is untouched and always available.
+auth       required     pam_faillock.so preauth silent deny=10 unlock_time=120
+auth       required     pam_howdy.so
+account    include      system-local-login
+EOF
+  sudo chmod 644 "$PAM_FACE"
+}
+
+enable_sudo_face() {
+  sudo_configured && return 0
+  sudo cp -a "$PAM_SUDO" "$PAM_SUDO.face-unlock.bak"
+  # Insert directly above the first auth line, so the face is tried first and
+  # everything after it (the password) is left exactly as it was.
+  sudo sed -i -E "0,/^\s*auth\s/{s/^(\s*auth\s)/$SUDO_LINE\n\1/}" "$PAM_SUDO"
+  if ! sudo_configured; then
+    sudo cp -a "$PAM_SUDO.face-unlock.bak" "$PAM_SUDO"
+    warn "Could not add Face Unlock to sudo; restored the original file."
+    return 1
+  fi
+}
+
+disable_sudo_face() {
+  sudo_configured || return 0
+  sudo sed -i -E '/^\s*auth\s+sufficient\s+pam_howdy\.so\s*$/d' "$PAM_SUDO"
+}
+
+install_launcher() {
+  mkdir -p "$(dirname "$DESKTOP_FILE")" "$(dirname "$BIN_LINK")"
+  ln -sfn "$SELF" "$BIN_LINK"
+  cat >"$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Face Unlock
+Comment=Set up Face Unlock and manage your enrolled faces
+Exec=omarchy-launch-floating-terminal-with-presentation "$SELF"
+Icon=$PLUGIN_DIR/assets/face-unlock.svg
+Terminal=false
+Categories=Settings;Security;
+Keywords=face;howdy;unlock;lock;login;camera;faceid;
+EOF
+}
+
+enable_plugin() {
+  local state
+  state=$(plugin_state)
+  if [[ -z $state ]]; then
+    warn "Omarchy doesn't see the $PLUGIN_ID plugin yet."
+    say "Install it with: omarchy plugin add https://github.com/phi0x/omarchy-face-unlock.git"
+    return 1
+  fi
+  if [[ $state != enabled ]]; then
+    omarchy plugin enable "$PLUGIN_ID" >/dev/null || return 1
+  fi
+  # The lock must still answer after the switch; otherwise fall back.
+  local tries=0 status=""
+  while ((tries++ < 20)); do
+    status=$(omarchy-shell lock status 2>/dev/null) && [[ $status == *'"passwordPam":true'* ]] && break
+    sleep 0.25
+  done
+  if [[ $status != *'"passwordPam":true'* ]]; then
+    warn "The Face Unlock lock screen did not come up; switching back to the stock lock screen."
+    omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 || true
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------- wizard ----
+
+wizard() {
+  interactive || die "The setup wizard needs a terminal (try: omarchy-launch-floating-terminal-with-presentation face-unlock setup)."
+  clear
+  banner
+  say "" "This wizard will:" \
+    "  1. install Howdy Next, the face recognition engine" \
+    "  2. pick your camera and teach it your face" \
+    "  3. add Face Unlock to the Omarchy lock screen" ""
+  gum style --border rounded --padding "0 2" --margin "0 1" \
+    "$(gum style --bold 'Before you start')" \
+    "Face Unlock is a convenience, not extra security. Most webcams (unlike" \
+    "IR cameras such as Windows Hello) can be fooled by a good photo of you." \
+    "Your password keeps working, and the camera only turns on when you" \
+    "wake the lock screen — never in the background."
+  echo
+  confirm "Continue?" || return 0
+
+  ensure_settings
+  need_sudo
+
+  # 1. Engine ------------------------------------------------------------------
+  title "1 · Face recognition engine"
+  if howdy_installed; then
+    ok "Howdy Next is installed ($(howdy version 2>/dev/null | head -n1))."
+  else
+    say "Howdy Next is built from the AUR ($HOWDY_PKG). yay will show you the" \
+      "build files and ask before installing; this can take a few minutes."
+    confirm "Install $HOWDY_PKG now?" || { warn "Setup needs Howdy Next. Run 'face-unlock setup' again any time."; return 1; }
+    if have yay; then
+      yay -S --needed "$HOWDY_PKG" || die "Installation failed."
+    else
+      die "yay is not available; install $HOWDY_PKG from the AUR manually and re-run setup."
+    fi
+    howdy_installed || die "Howdy Next did not install correctly."
+    ok "Installed Howdy Next."
+  fi
+  gum spin --title "Downloading recognition models…" -- sudo howdy download-models >/dev/null 2>&1 &&
+    ok "Recognition models ready." || warn "Model download reported a problem; Howdy may already have them."
+
+  # 2. Camera ------------------------------------------------------------------
+  title "2 · Camera"
+  choose_camera || die "Setup needs a camera."
+  sudo howdy set timeout 4 >/dev/null
+  sudo howdy set no_confirmation true >/dev/null
+  sudo howdy set detection_notice false >/dev/null
+
+  # 3. Faces -------------------------------------------------------------------
+  title "3 · Your face"
+  local existing
+  existing=$(faces_list_raw | wc -l)
+  if ((existing > 0)); then
+    ok "You already have $existing face(s) enrolled."
+    confirm "Add another look now?" default-no && face_add
+  else
+    face_add "Default" || { warn "Let's try once more."; face_add "Default" || die "Could not enroll a face."; }
+    while confirm "Add another look (glasses, low light…)? It makes matching more reliable." default-no; do
+      face_add || true
+    done
+  fi
+
+  # 4. Lock screen ---------------------------------------------------------------
+  title "4 · Lock screen"
+  write_face_pam && ok "Lock screen authentication added ($PAM_FACE)."
+  set_setting enabled true
+
+  if sudo_configured; then
+    ok "Face Unlock is also enabled for sudo."
+  else
+    say "Optionally, sudo can try your face before asking for a password." \
+      "Note: the camera will then turn on whenever anything runs sudo."
+    if confirm "Use Face Unlock for sudo too?" default-no; then
+      enable_sudo_face && ok "sudo will try your face first."
+    fi
+  fi
+
+  # 5. Look and feel ------------------------------------------------------------
+  title "5 · Bar icon & launcher"
+  if confirm "Show a Face Unlock icon in the top bar?"; then set_setting showBarIcon true; else set_setting showBarIcon false; fi
+  install_launcher && ok "Added “Face Unlock” to the app launcher."
+
+  if enable_plugin; then
+    ok "The Face Unlock lock screen is active."
+  else
+    warn "Face Unlock is configured, but the plugin isn't active yet."
+  fi
+
+  echo
+  gum style --border rounded --padding "1 3" --margin "0 1" \
+    "$(gum style --bold 'All set!')" "" \
+    "Lock with Super + Ctrl + L, wait a moment, then press any key or move" \
+    "the mouse — the camera wakes up and looks for you." "" \
+    "Manage faces any time from the bar icon, the app launcher, or" \
+    "face-unlock faces"
+  pause
+}
+
+# ---------------------------------------------------------------- uninstall --
+
+uninstall() {
+  interactive || die "Run uninstall from a terminal."
+  clear
+  title "Remove Face Unlock"
+  say "This switches back to the stock Omarchy lock screen and removes the" \
+    "Face Unlock PAM configuration. Your password is unaffected."
+  confirm "Continue?" default-no || return 0
+  need_sudo
+  omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 && ok "Stock lock screen restored."
+  disable_sudo_face && ok "sudo no longer uses Face Unlock."
+  sudo rm -f "$PAM_FACE" && ok "Removed $PAM_FACE."
+  rm -f "$DESKTOP_FILE" "$BIN_LINK"
+  if howdy_installed && confirm "Also delete your enrolled faces?" default-no; then
+    sudo howdy -U "$TARGET_USER" -y clear >/dev/null 2>&1 && ok "Faces deleted."
+  fi
+  if pacman -Q "$HOWDY_PKG" >/dev/null 2>&1 && confirm "Uninstall $HOWDY_PKG as well?" default-no; then
+    sudo pacman -Rns "$HOWDY_PKG"
+  fi
+  say "" "To remove the plugin files: omarchy plugin remove $PLUGIN_ID"
+  pause
+}
+
+# ---------------------------------------------------------------- home ------
+
+home() {
+  interactive || { cmd_status; return; }
+  while true; do
+    clear
+    banner
+    local enabled bar choices=()
+    enabled=$(setting enabled true)
+    bar=$(setting showBarIcon true)
+    if pam_configured; then
+      choices+=("Manage faces" "Change camera")
+      [[ $enabled == true ]] && choices+=("Turn Face Unlock off") || choices+=("Turn Face Unlock on")
+      [[ $bar == true ]] && choices+=("Hide the bar icon") || choices+=("Show the bar icon")
+      choices+=("Preview the lock screen" "Run setup again" "Remove Face Unlock")
+    else
+      choices+=("Set up Face Unlock")
+    fi
+    choices+=("Quit")
+    local action
+    action=$(gum choose --header "" "${choices[@]}") || return 0
+    case $action in
+      "Manage faces") faces_menu ;;
+      "Change camera") camera_menu ;;
+      "Turn Face Unlock off") set_setting enabled false ;;
+      "Turn Face Unlock on") set_setting enabled true ;;
+      "Hide the bar icon") set_setting showBarIcon false ;;
+      "Show the bar icon") set_setting showBarIcon true ;;
+      "Preview the lock screen") cmd_demo_cycle ;;
+      "Set up Face Unlock" | "Run setup again") wizard ;;
+      "Remove Face Unlock") uninstall ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+cmd_status() {
+  if [[ ${1:-} == --json ]]; then
+    jq -n \
+      --argjson howdy "$(howdy_installed && echo true || echo false)" \
+      --argjson pam "$(pam_configured && echo true || echo false)" \
+      --argjson sudo "$(sudo_configured && echo true || echo false)" \
+      --arg plugin "$(plugin_state)" \
+      --argjson settings "$(ensure_settings; cat "$SETTINGS")" \
+      '{howdyInstalled: $howdy, lockScreenConfigured: $pam, sudoConfigured: $sudo, plugin: $plugin, settings: $settings}'
+    return
+  fi
+  printf 'Face Unlock: %s\n' "$(status_line)"
+  printf '  engine      %s\n' "$(howdy_installed && echo 'Howdy Next installed' || echo 'not installed')"
+  printf '  lock screen %s\n' "$(pam_configured && echo configured || echo 'not configured')"
+  local cam; cam=$(current_camera)
+  printf '  camera      %s\n' "$([[ -n $cam ]] && camera_name "$cam" || echo 'not set')"
+  printf '  sudo        %s\n' "$(sudo_configured && echo 'uses face' || echo 'password only')"
+  printf '  plugin      %s\n' "$(plugin_state || true)"
+  printf '  bar icon    %s\n' "$([[ $(setting showBarIcon true) == true ]] && echo shown || echo hidden)"
+}
+
+cmd_demo_cycle() {
+  local m
+  for m in idle scanning failure resting scanning success; do
+    omarchy-shell face-unlock demo "$m" >/dev/null 2>&1 || { warn "The Face Unlock lock screen isn't active."; return 1; }
+    case $m in scanning) sleep 2.4 ;; *) sleep 1.8 ;; esac
+  done
+  omarchy-shell lock hidePreview >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- main ------
+
+main() {
+  have jq || die "jq is required."
+  local cmd="${1:-}"
+  shift || true
+  case $cmd in
+    "") home ;;
+    setup) wizard ;;
+    faces)
+      local sub="${1:-}"
+      shift || true
+      case $sub in
+        "") faces_menu ;;
+        list) faces_print ;;
+        add) face_add "${1:-}" ;;
+        remove) face_remove "$@" ;;
+        clear) face_clear ;;
+        test) face_test ;;
+        *) die "Usage: face-unlock faces [list|add [LABEL]|remove ID...|clear|test]" ;;
+      esac
+      ;;
+    camera)
+      case ${1:-} in
+        "") camera_menu ;;
+        list) camera_list | awk -F'\t' -v c="$(current_camera)" '{ printf "%s %s\t%s\n", ($1 == c ? "*" : " "), $2, $1 }' ;;
+        set) [[ -n ${2:-} ]] || die "Usage: face-unlock camera set PATH"; need_sudo; set_camera "$2" ;;
+        *) die "Usage: face-unlock camera [list|set PATH]" ;;
+      esac
+      ;;
+    enable) set_setting enabled true; ok "Face Unlock on." ;;
+    disable) set_setting enabled false; ok "Face Unlock off (password only)." ;;
+    toggle)
+      if [[ $(setting enabled true) == true ]]; then set_setting enabled false; ok "Face Unlock off."
+      else set_setting enabled true; ok "Face Unlock on."; fi
+      ;;
+    bar)
+      case ${1:-} in
+        show) set_setting showBarIcon true; ok "Bar icon shown." ;;
+        hide) set_setting showBarIcon false; ok "Bar icon hidden. Bring it back with: face-unlock bar show" ;;
+        *) die "Usage: face-unlock bar show|hide" ;;
+      esac
+      ;;
+    status) cmd_status "${1:-}" ;;
+    demo)
+      if [[ -z ${1:-} ]]; then cmd_demo_cycle
+      elif [[ $1 == off ]]; then omarchy-shell lock hidePreview >/dev/null
+      else omarchy-shell face-unlock demo "$1"; fi
+      ;;
+    install-launcher) install_launcher && ok "Launcher installed." ;;
+    uninstall) uninstall ;;
+    -h | --help | help) sed -n '2,15p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+    *) die "Unknown command: $cmd (see face-unlock --help)" ;;
+  esac
+}
+
+main "$@"

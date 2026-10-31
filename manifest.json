@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "phi0x.face-unlock",
+  "name": "Face Unlock",
+  "version": "0.1.0",
+  "author": "phi0x",
+  "description": "Face ID-style webcam unlock for the Omarchy lock screen, powered by Howdy Next",
+  "omarchy": {
+    "clonedFrom": "omarchy.lock"
+  },
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Face Unlock",
+    "description": "Turn Face Unlock on or off and manage enrolled faces",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
