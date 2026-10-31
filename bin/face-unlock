@@ -394,10 +394,23 @@ install_howdy_unattended() {
   mkdir -p "$log_dir"
   say "Building Howdy Next from the AUR ($HOWDY_PKG) — this takes a few minutes." \
     "$(gum style --faint "Full log: $log")"
-  if gum spin --title "Installing Howdy Next… (a few minutes)" -- bash -c \
-    'yay -S --needed --noconfirm --answerdiff None --answerclean None --answeredit None --removemake --sudoloop "$1" >"$2" 2>&1' \
-    _ "$HOWDY_PKG" "$log"; then
+  local yay_cmd='yay -S --needed --noconfirm --answerdiff None --answerclean None --answeredit None --removemake --sudoloop "$@" >"$LOG" 2>&1'
+  if LOG="$log" gum spin --title "Installing Howdy Next… (a few minutes)" -- bash -c "$yay_cmd" _ "$HOWDY_PKG"; then
     return 0
+  fi
+  # howdy-next-git builds upstream HEAD, whose test suite occasionally has a
+  # failing case (e.g. a prompt-workaround test this plugin never exercises).
+  # Only when the build itself succeeded and check() alone failed, retry once
+  # without tests; any compile or install error still stops here.
+  if grep -q "A failure occurred in check()" "$log"; then
+    warn "Howdy Next compiled, but one of its upstream self-tests failed:"
+    grep -E '^FAIL:' "$log" | head -n 5 | sed 's/^/    /'
+    say "Face Unlock uses plain pam_howdy.so, so this is usually harmless. Retrying without tests…"
+    cp -f "$log" "$log.with-tests"
+    if LOG="$log" gum spin --title "Installing Howdy Next (tests skipped)…" -- bash -c "$yay_cmd" _ --mflags --nocheck "$HOWDY_PKG"; then
+      ok "Installed (upstream tests skipped; see $log.with-tests)."
+      return 0
+    fi
   fi
   warn "Installation failed. Last lines of the log:"
   tail -n 25 "$log" | sed 's/^/    /'
