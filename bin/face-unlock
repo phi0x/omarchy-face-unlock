@@ -467,14 +467,12 @@ wizard() {
   title "3 · Your face"
   local existing
   existing=$(faces_list_raw | wc -l)
+  # Setup enrolls one face and moves on. Extra looks (glasses, low light)
+  # are managed later from Manage faces, where they belong.
   if ((existing > 0)); then
     ok "You already have $existing face(s) enrolled."
-    confirm "Add another look now?" default-no && face_add
   else
     face_add "Default" || { warn "Let's try once more."; face_add "Default" || die "Could not enroll a face."; }
-    while confirm "Add another look (glasses, low light…)? It makes matching more reliable." default-no; do
-      face_add || true
-    done
   fi
 
   # 4. Lock screen ---------------------------------------------------------------
@@ -510,8 +508,9 @@ wizard() {
     "$(gum style --bold 'All set!')" "" \
     "Lock with Super + Ctrl + L, wait a moment, then press any key or move" \
     "the mouse — the camera wakes up and looks for you." "" \
-    "Manage faces any time from the bar icon, the app launcher, or" \
-    "face-unlock faces"
+    "Wear glasses sometimes, or work in low light? Add those looks from" \
+    "Manage faces (bar icon, app launcher, or face-unlock faces) for" \
+    "faster, more reliable matches."
   pause
 }
 
