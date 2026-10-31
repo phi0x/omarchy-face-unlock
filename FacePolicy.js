@@ -129,3 +129,31 @@ function copy(state) {
   for (var k in state) out[k] = state[k]
   return out
 }
+
+// Friendly camera name from a /dev/v4l path or device id, e.g.
+//   /dev/v4l/by-id/usb-Razer_Inc_Razer_Kiyo_Pro_Ultra-video-index0
+//     -> "Razer Kiyo Pro Ultra"
+// Drops bus prefixes, corporate suffixes, a repeated vendor name, bare USB
+// vendor ids and trailing serial numbers. bin/face-unlock mirrors this in
+// camera_pretty(); tests/test_camera_names.sh keeps the two in step.
+function prettyCameraName(path) {
+  var raw = String(path || "")
+  if (!raw) return ""
+  var n = raw.split("/").pop()
+    .replace(/^(usb|pci|platform)-/, "")
+    .replace(/-video-index\d+$/, "")
+    .replace(/_/g, " ")
+  var tokens = n.split(/\s+/).filter(function(t) {
+    return t && !/^(inc|corp|corporation|co|ltd|llc|gmbh|limited|incorporated)[.,]*$/i.test(t)
+  })
+  if (tokens.length > 1 && /^[0-9a-f]{4}$/i.test(tokens[0])) tokens.shift()
+  if (tokens.length > 1) {
+    var first = tokens[0].toLowerCase()
+    for (var i = 1; i < tokens.length; i++) {
+      if (tokens[i].toLowerCase() === first) { tokens = tokens.slice(i); break }
+    }
+  }
+  while (tokens.length > 1 && /^(\d{4,}|[0-9a-f]{8,})$/i.test(tokens[tokens.length - 1])) tokens.pop()
+  var out = tokens.join(" ")
+  return out || raw
+}

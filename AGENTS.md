@@ -30,6 +30,7 @@ clone mechanism and adds a Howdy Next face flow.
 
 ```sh
 node tests/test_policy.js
+bash tests/test_camera_names.sh
 bash -n bin/face-unlock
 omarchy plugin validate .
 omarchy restart shell && omarchy-shell lock status   # passwordPam must be true

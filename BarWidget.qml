@@ -4,6 +4,7 @@ import Quickshell.Io
 import qs.Ui
 import qs.Commons
 import qs.Commons as Commons
+import "FacePolicy.js" as FacePolicy
 
 // Optional bar icon. It never touches PAM or the lock service: it reads the
 // same settings file the lock service watches, and every change goes through
@@ -24,12 +25,7 @@ BarWidget {
 
   readonly property bool enabled: settings.enabled !== false
   readonly property bool showIcon: settings.showBarIcon !== false
-  readonly property string cameraName: {
-    var p = String(settings.camera || "")
-    if (!p) return "Not chosen"
-    var n = p.split("/").pop().replace(/^usb-/, "").replace(/-video-index\d+$/, "").replace(/_/g, " ")
-    return n || p
-  }
+  readonly property string cameraName: settings.camera ? FacePolicy.prettyCameraName(settings.camera) : "Not chosen"
   readonly property string statusText: !pamConfigured ? "Not set up yet"
     : (enabled ? "On · unlocks when you wake the lock screen" : "Off · password only")
 
@@ -154,9 +150,22 @@ BarWidget {
         leftAlign: true
         bordered: true
         visible: root.pamConfigured
+        id: cameraButton
         iconText: "󰄀"
-        text: "Camera: " + root.cameraName
-        tooltipText: "Choose which camera looks for you"
+        // Button never elides, so measure at its font and trim to fit.
+        text: cameraLabel.elidedText
+        tooltipText: "Camera: " + root.cameraName + " · click to change"
+
+        TextMetrics {
+          id: cameraLabel
+          font.family: cameraButton.fontFamily
+          font.pixelSize: cameraButton.fontSize
+          text: "Camera: " + root.cameraName
+          elide: Text.ElideRight
+          // icon + gap + both paddings + borders
+          elideWidth: Math.max(40, cameraButton.width - cameraButton.iconSize - Style.spacing.controlGap
+            - cameraButton.horizontalPadding * 2 - Style.space(12))
+        }
         foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         onClicked: root.openTerminal("camera")
       }

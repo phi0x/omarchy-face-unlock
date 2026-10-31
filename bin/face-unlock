@@ -141,19 +141,38 @@ need_sudo() {
   sudo -v || die "sudo is required for this step."
 }
 
+camera_pretty() { # camera_pretty PATH -> friendly name; mirrors FacePolicy.prettyCameraName
+  local n="${1##*/}" out="" t i first
+  n=${n#usb-}; n=${n#pci-}; n=${n#platform-}
+  n=$(sed -E 's/-video-index[0-9]+$//' <<<"$n")
+  n=${n//_/ }
+  local tokens=()
+  for t in $n; do
+    shopt -s nocasematch
+    [[ $t =~ ^(inc|corp|corporation|co|ltd|llc|gmbh|limited|incorporated)[.,]*$ ]] || tokens+=("$t")
+    shopt -u nocasematch
+  done
+  if ((${#tokens[@]} > 1)) && [[ ${tokens[0]} =~ ^[0-9a-fA-F]{4}$ ]]; then tokens=("${tokens[@]:1}"); fi
+  if ((${#tokens[@]} > 1)); then
+    first=${tokens[0],,}
+    for ((i = 1; i < ${#tokens[@]}; i++)); do
+      if [[ ${tokens[i],,} == "$first" ]]; then tokens=("${tokens[@]:i}"); break; fi
+    done
+  fi
+  while ((${#tokens[@]} > 1)) && [[ ${tokens[-1]} =~ ^([0-9]{4,}|[0-9a-fA-F]{8,})$ ]]; do unset 'tokens[-1]'; done
+  out="${tokens[*]}"
+  printf '%s' "${out:-$1}"
+}
+
 camera_list() {
   # Prints "path<TAB>friendly name" for capture nodes, preferring stable ids.
-  local dev name seen=()
+  local dev seen=()
   shopt -s nullglob
   for dev in /dev/v4l/by-id/*-video-index0 /dev/v4l/by-path/*-video-index0; do
     # by-path is only a fallback for cameras without a usable id.
     if [[ $dev == /dev/v4l/by-path/* ]] && printf '%s\n' "${seen[@]:-}" | grep -qx "$(readlink -f "$dev")"; then continue; fi
     seen+=("$(readlink -f "$dev")")
-    name=$(basename "$dev")
-    name=${name#usb-}
-    name=${name%-video-index0}
-    name=${name//_/ }
-    printf '%s\t%s\n' "$dev" "$name"
+    printf '%s\t%s\n' "$dev" "$(camera_pretty "$dev")"
   done
   shopt -u nullglob
 }
@@ -163,7 +182,7 @@ valid_label() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9\ _.-]{0,31}$ ]]; }
 camera_name() { # camera_name PATH -> friendly name (or the path)
   local n
   n=$(camera_list | awk -F'\t' -v p="$1" '$1 == p { print $2; exit }')
-  printf '%s' "${n:-$1}"
+  printf '%s' "${n:-$(camera_pretty "$1")}"
 }
 
 current_camera() { setting camera ""; }

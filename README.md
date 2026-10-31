@@ -143,6 +143,7 @@ omarchy plugin remove phi0x.face-unlock  # remove the plugin files
 
 ```sh
 node tests/test_policy.js
+bash tests/test_camera_names.sh
 bash -n bin/face-unlock
 omarchy plugin validate .
 face-unlock demo        # cycles the glyph states on the lock preview
